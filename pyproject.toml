@@ -9,3 +9,12 @@ dependencies = ["pyserial>=3.5"]
 package = false
 # The system Python on this machine ships without tkinter; uv's managed builds include it.
 python-preference = "only-managed"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+]

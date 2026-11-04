@@ -14,6 +14,8 @@ from tkinter import filedialog, messagebox, ttk
 import serial
 from serial.tools import list_ports
 
+from cam_import import ConvertError, Options as CamOptions, convert as convert_cam, fmt
+
 SIM_PORT = "SIMULATOR"
 BAUDS = ["9600", "19200", "38400", "57600", "115200", "250000"]
 ACK_TIMEOUT = 10  # seconds to wait for a reply before warning and sending the next line
@@ -412,8 +414,8 @@ class App:
         self.spindle_on = False
 
         root.title("Soft-CNC — G-code control (test)")
-        root.geometry("1000x740")
-        root.minsize(840, 680)
+        root.geometry("1040x800")
+        root.minsize(900, 740)
         self._build()
         self._set_connected(False)
         self.refresh_ports()
@@ -541,10 +543,31 @@ class App:
         self.send_btn = ttk.Button(entry_row, text="Send", command=self.send_entry)
         self.send_btn.pack(side="left", padx=4)
 
+        # PCB board: where the board sits on the machine, used to convert CAM G-code (cam_import.py)
+        board = ttk.LabelFrame(self.root, text="PCB board (for Import CAM)")
+        board.pack(fill="x", **pad)
+        self.origin_x_var, self.origin_y_var, self.surface_var = tk.StringVar(), tk.StringVar(), tk.StringVar()
+        self.air_var = tk.BooleanVar(value=True)  # first runs are dry runs; untick for the real cut
+        self.air_offset_var = tk.StringVar(value="5")
+        ttk.Label(board, text="Origin X").pack(side="left", padx=(4, 0))
+        ttk.Entry(board, textvariable=self.origin_x_var, width=8).pack(side="left", **pad)
+        ttk.Label(board, text="Y").pack(side="left")
+        ttk.Entry(board, textvariable=self.origin_y_var, width=8).pack(side="left", **pad)
+        self.origin_btn = ttk.Button(board, text="Set origin here", command=self.set_origin_here)
+        self.origin_btn.pack(side="left", **pad)
+        ttk.Label(board, text="Surface Z").pack(side="left", padx=(12, 0))
+        ttk.Entry(board, textvariable=self.surface_var, width=8).pack(side="left", **pad)
+        self.surface_btn = ttk.Button(board, text="Set surface Z here", command=self.set_surface_here)
+        self.surface_btn.pack(side="left", **pad)
+        ttk.Checkbutton(board, text="Air test: lift by", variable=self.air_var).pack(side="left", padx=(12, 0))
+        ttk.Entry(board, textvariable=self.air_offset_var, width=4).pack(side="left", **pad)
+        ttk.Label(board, text="mm").pack(side="left")
+
         # Bottom: G-code file streaming
         job = ttk.LabelFrame(self.root, text="G-code file")
         job.pack(fill="x", **pad)
         ttk.Button(job, text="Load…", command=self.load_file).pack(side="left", **pad)
+        ttk.Button(job, text="Import CAM…", command=self.import_cam).pack(side="left", **pad)
         self.file_var = tk.StringVar(value="(no file)")
         ttk.Label(job, textvariable=self.file_var, width=36).pack(side="left", **pad)
         self.start_btn = ttk.Button(job, text="Start", command=self.start_job)
@@ -580,7 +603,8 @@ class App:
         connected = self.link is not None
         running = self.job_running()
         manual = "normal" if connected and not running else "disabled"
-        for w in self.jog_buttons + self.machine_buttons + self.spindle_buttons + [self.send_btn, self.cmd_entry]:
+        for w in (self.jog_buttons + self.machine_buttons + self.spindle_buttons
+                  + [self.send_btn, self.cmd_entry, self.origin_btn, self.surface_btn]):
             w.configure(state=manual)
         if connected and self.fw_var.get() == "GRBL":  # real-time commands work mid-job on GRBL
             for w in self.machine_buttons[4:]:
@@ -875,6 +899,103 @@ class App:
         self.file_var.set(f"{path.replace(chr(92), '/').split('/')[-1]} ({len(self.job_lines)} lines)")
         self.log(f"Loaded {path}: {len(self.job_lines)} lines", "info")
         self._update_controls()
+
+    # ---------- PCB: import CAM G-code ----------
+    def _known_position(self):
+        work = self.tracker.work() if self.tracker else None
+        if work is None:
+            self.log("Position unknown: connect as Cirqoid and press Home first.", "err")
+        return work
+
+    def set_origin_here(self):
+        work = self._known_position()
+        if work:
+            self.origin_x_var.set(fmt(work["X"]))
+            self.origin_y_var.set(fmt(work["Y"]))
+            self.log(f"Board origin set to X{fmt(work['X'])} Y{fmt(work['Y'])}", "info")
+
+    def set_surface_here(self):
+        work = self._known_position()
+        if work:
+            self.surface_var.set(fmt(work["Z"]))
+            self.log(f"Copper surface set to Z{fmt(work['Z'])} (re-do this after every bit change)", "info")
+
+    def import_cam(self):
+        """Load G-code from FlatCAM / pcb2gcode, converted to the Cirqoid dialect at the board's position."""
+        try:
+            origin_x, origin_y, surface = (float(v.get()) for v in
+                                           (self.origin_x_var, self.origin_y_var, self.surface_var))
+            air = float(self.air_offset_var.get()) if self.air_var.get() else 0.0
+        except ValueError:
+            messagebox.showerror("Import CAM", "Set the board origin (X, Y) and the surface Z first.\n\n"
+                                 "Home, jog the bit over the board corner and press 'Set origin here', then "
+                                 "lower it onto the copper and press 'Set surface Z here'.")
+            return
+        path = filedialog.askopenfilename(
+            title="G-code from FlatCAM / pcb2gcode",
+            filetypes=[("CAM G-code", "*.nc *.ngc *.gcode *.cnc *.tap *.txt"), ("All files", "*.*")])
+        if not path:
+            return
+        options = CamOptions(air_offset=air, max_spindle=SPINDLE_MAX,
+                             max_z_feed=JOG_MAX_FEED["Cirqoid"]["Z"], rapid_z_feed=JOG_MAX_FEED["Cirqoid"]["Z"])
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                result = convert_cam(fh.read(), origin_x, origin_y, surface, options)
+        except ConvertError as exc:
+            messagebox.showerror("Import CAM", f"Can't convert this file:\n\n{exc}")
+            return
+        index = 0 if len(result.sections) == 1 else self._pick_section(result.sections)
+        if index is None:
+            return
+        section = result.sections[index]
+        self.job_lines = list(section.lines)
+        name = path.replace(chr(92), "/").split("/")[-1]
+        self.file_var.set(f"{name} · {section.tool} ({len(self.job_lines)} lines, converted)")
+        self.log(f"Imported {name}: {section.tool}{' - ' + section.note if section.note else ''}, "
+                 f"{len(self.job_lines)} lines", "info")
+        for warning in result.warnings:
+            self.log(f"  note: {warning}", "rx")
+        self.log("  moves span " + ", ".join(f"{axis} {fmt(lo)}..{fmt(hi)}"
+                                             for axis, (lo, hi) in sorted(section.bounds.items())), "info")
+        if len(result.sections) > 1:
+            self.log(f"  this file has {len(result.sections)} tools ("
+                     + ", ".join(s.tool for s in result.sections)
+                     + "): after this one, change the bit, set the surface Z again and import the next.", "info")
+        if air:
+            self.log(f"  AIR TEST: the whole job is lifted {fmt(air)} mm. Untick 'Air test' and import again "
+                     "for the real cut.", "info")
+        if self.fw_var.get() != "Cirqoid":
+            self.log("  note: converted for the Cirqoid; the current firmware setting is "
+                     f"{self.fw_var.get()}", "err")
+        self._update_controls()
+
+    def _pick_section(self, sections):
+        """Ask which tool section of a multi-tool file to load. Returns its index, or None."""
+        win = tk.Toplevel(self.root)
+        win.title("Pick the tool to run")
+        win.transient(self.root)
+        win.grab_set()
+        ttk.Label(win, text="This file uses several tools. Load one at a time: change the bit and set the "
+                            "surface Z before each.").pack(padx=8, pady=6)
+        box = tk.Listbox(win, width=80, height=min(10, len(sections)))
+        for section in sections:
+            box.insert("end", f"{section.tool}   {section.note}   ({len(section.lines)} lines)")
+        box.selection_set(0)
+        box.pack(padx=8)
+        choice = {}
+
+        def load():
+            selected = box.curselection()
+            choice["index"] = selected[0] if selected else None
+            win.destroy()
+
+        box.bind("<Double-1>", lambda e: load())
+        row = ttk.Frame(win)
+        row.pack(pady=6)
+        ttk.Button(row, text="Load", command=load).pack(side="left", padx=4)
+        ttk.Button(row, text="Cancel", command=win.destroy).pack(side="left", padx=4)
+        win.wait_window()
+        return choice.get("index")
 
     def start_job(self):
         if not (self.link and self.job_lines):
