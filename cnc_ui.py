@@ -4,11 +4,13 @@ Run with:  uv run cnc_ui.py
 Pick the port "SIMULATOR" to try the UI without a machine attached.
 """
 
+import json
 import queue
 import re
 import threading
 import time
 import tkinter as tk
+from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 import serial
@@ -48,6 +50,20 @@ REPLY_EXPECTED = {"Cirqoid": re.compile(r"\bG0?[0-3]\b|\bG28\b|^[XYZ]", re.IGNOR
 MOTION_TIMEOUT = 120  # seconds; homing can take a while
 # Highest jog feed per axis (mm/min); Cirqoid's own programs move Z at F300.
 JOG_MAX_FEED = {"Cirqoid": {"Z": 300.0}}
+SETTINGS_FILE = Path.home() / ".soft-cnc.json"  # remembers small UI preferences such as the theme
+# "app" is the window background; "bg" is the cards (sections) drawn on it.
+THEMES = {
+    "light": {"app": "#e4e7ec", "bg": "#ffffff", "fg": "#1f2328", "muted": "#6b7280", "field": "#f6f7f9",
+              "button": "#eceef2", "hover": "#dde1e7", "border": "#d0d5dd", "select": "#d6e6fb",
+              "accent": "#1f6feb", "accent_hover": "#3b82f6", "accent_fg": "#ffffff", "good": "#1a7f37",
+              "disabled": "#a3a8b0", "console_bg": "#fafbfc", "console_fg": "#2d333b",
+              "tx": "#1f5fbf", "err": "#cf222e", "info": "#1a7f37", "ok": "#6a9a6a"},
+    "dark": {"app": "#141414", "bg": "#202124", "fg": "#e6e6e6", "muted": "#8b9099", "field": "#2a2b2e",
+             "button": "#303134", "hover": "#3c3d41", "border": "#36373b", "select": "#264f78",
+             "accent": "#2f81f7", "accent_hover": "#4b93f8", "accent_fg": "#ffffff", "good": "#57ab5a",
+             "disabled": "#5c5f66", "console_bg": "#151618", "console_fg": "#d4d4d4",
+             "tx": "#7fc7ff", "err": "#ff6b6b", "info": "#9ccc65", "ok": "#5f8f5f"},
+}
 SPINDLE_MAX = 1400  # above this the spindle doesn't get any faster
 SPINDLE_STEP = 50
 
@@ -125,6 +141,13 @@ class PositionTracker:
                         return f"{axis} would go to {pos:g} mm from home; soft limit is {lo:g} to {hi:g}"
             self.machine.update(target)
         return None
+
+
+def looks_like_cam(lines):
+    """True for G-code from a CAM tool (Z0 = copper surface): it goes above Z0 and never homes the Cirqoid."""
+    homes = any(re.search(r"\bG28\b", line, re.IGNORECASE) for line in lines)
+    above = any(float(z) > 0 for line in lines for z in re.findall(r"Z\s*([-+]?\d*\.?\d+)", line, re.IGNORECASE))
+    return above and not homes
 
 
 def clean_gcode(text):
@@ -412,56 +435,94 @@ class App:
         self.sent = set()  # tags already written to the port
         self.next_tag = 0
         self.spindle_on = False
+        self.last_msg_tag = None
+        self.display = None
 
         root.title("Soft-CNC — G-code control (test)")
-        root.geometry("1040x800")
-        root.minsize(900, 740)
+        root.geometry("1040x720")
+        root.minsize(900, 660)
+        self.theme = self._load_settings().get("theme", "light")
+        self.palette = THEMES.get(self.theme, THEMES["light"])
         self._build()
+        self.apply_theme(self.theme if self.theme in THEMES else "light")
         self._set_connected(False)
         self.refresh_ports()
+        self._bind_keys()
         root.after(50, self._drain_events)
         root.after(250, self._poll_status)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
 
     # ---------- layout ----------
-    def _build(self):
-        pad = {"padx": 4, "pady": 4}
+    @staticmethod
+    def _card(parent, title=None, **pack):
+        """A section panel (lighter than the window background) with a small bold header."""
+        card = ttk.Frame(parent, style="Card.TFrame", padding=(12, 8, 12, 10))
+        card.pack(fill="x", **({"pady": (0, 8)} | pack))
+        if title:
+            ttk.Label(card, text=title.upper(), style="CardTitle.TLabel").pack(anchor="w", pady=(0, 6))
+        return card
 
-        top = ttk.Frame(self.root)
-        top.pack(fill="x", **pad)
+    def _build(self):
+        outer = ttk.Frame(self.root, style="App.TFrame", padding=10)
+        outer.pack(fill="both", expand=True)
+
+        # Top bar: connection
+        top = ttk.Frame(outer, style="Card.TFrame", padding=(12, 8))
+        top.pack(fill="x", pady=(0, 8))
         ttk.Label(top, text="Port").pack(side="left")
         self.port_var = tk.StringVar()
-        self.port_box = ttk.Combobox(top, textvariable=self.port_var, width=34, state="readonly")
-        self.port_box.pack(side="left", **pad)
+        self.port_box = ttk.Combobox(top, textvariable=self.port_var, width=28, state="readonly")
+        self.port_box.pack(side="left", padx=(6, 2))
         ttk.Button(top, text="↻", width=3, command=self.refresh_ports).pack(side="left")
-        ttk.Label(top, text="Baud").pack(side="left", padx=(12, 0))
+        ttk.Label(top, text="Baud").pack(side="left", padx=(14, 0))
         self.baud_var = tk.StringVar(value=DEFAULT_BAUD["Cirqoid"])
-        ttk.Combobox(top, textvariable=self.baud_var, values=BAUDS, width=8).pack(side="left", **pad)
-        ttk.Label(top, text="Firmware").pack(side="left", padx=(12, 0))
+        baud_box = ttk.Combobox(top, textvariable=self.baud_var, values=BAUDS, width=8)
+        baud_box.pack(side="left", padx=6)
+        ttk.Label(top, text="Firmware").pack(side="left", padx=(8, 0))
         self.fw_var = tk.StringVar(value="Cirqoid")
         fw_box = ttk.Combobox(top, textvariable=self.fw_var, values=list(FIRMWARE), width=8, state="readonly")
-        fw_box.pack(side="left", **pad)
-        fw_box.bind("<<ComboboxSelected>>", lambda e: self.baud_var.set(DEFAULT_BAUD[self.fw_var.get()]))
-        self.connect_btn = ttk.Button(top, text="Connect", command=self.toggle_connect)
-        self.connect_btn.pack(side="left", padx=(12, 4))
+        fw_box.pack(side="left", padx=6)
+        fw_box.bind("<<ComboboxSelected>>", lambda e: self._firmware_changed())
+        self.comboboxes = [self.port_box, baud_box, fw_box]
+        self.connect_btn = ttk.Button(top, text="Connect", style="Accent.TButton", width=11,
+                                      command=self.toggle_connect)
+        self.connect_btn.pack(side="left", padx=(10, 4))
         self.auto_btn = ttk.Button(top, text="Auto-detect", command=self.auto_detect)
-        self.auto_btn.pack(side="left", padx=(0, 12))
-        self.status_var = tk.StringVar(value="Disconnected")
-        ttk.Label(top, textvariable=self.status_var, font=("Consolas", 10)).pack(side="left")
+        self.auto_btn.pack(side="left")
+        self.theme_btn = ttk.Button(top, width=8, command=self.toggle_theme)
+        self.theme_btn.pack(side="right")
+        self.status_var = tk.StringVar(value="○ Disconnected")
+        self.status_label = ttk.Label(top, textvariable=self.status_var, font=("Segoe UI", 10, "bold"))
+        self.status_label.pack(side="right", padx=12)
 
-        body = ttk.Frame(self.root)
-        body.pack(fill="both", expand=True, **pad)
+        body = ttk.Frame(outer, style="App.TFrame")
+        body.pack(fill="both", expand=True)
 
-        # Left: jog + machine commands + e-stop
-        left = ttk.Frame(body)
-        left.pack(side="left", fill="y")
+        # Left: position readout, jog, machine commands, spindle, e-stop
+        left = ttk.Frame(body, style="App.TFrame")
+        left.pack(side="left", fill="y", padx=(0, 8))
+        self.estop_btn = tk.Button(left, text="E-STOP  (Esc)", bg="#c62828", fg="white", relief="flat",
+                                   activebackground="#8e0000", activeforeground="white", cursor="hand2",
+                                   font=("Segoe UI", 15, "bold"), command=self.estop)
+        self.estop_btn.pack(side="bottom", fill="x", ipady=6)  # packed first so it is never clipped
 
-        jog = ttk.LabelFrame(left, text="Jog")
-        jog.pack(fill="x", **pad)
+        dro = ttk.Frame(self._card(left, "Position · mm"))
+        dro.pack(fill="x")
+        dro.columnconfigure(1, weight=1)
+        self.pos_vars = {axis: tk.StringVar(value="—") for axis in "XYZ"}
+        for row, axis in enumerate("XYZ"):
+            ttk.Label(dro, text=axis, style="Axis.TLabel").grid(row=row, column=0, sticky="w")
+            ttk.Label(dro, textvariable=self.pos_vars[axis], style="DRO.TLabel", anchor="e").grid(
+                row=row, column=1, sticky="e")
+        self.pos_note_var = tk.StringVar(value="disconnected")
+        ttk.Label(dro, textvariable=self.pos_note_var, style="Muted.TLabel").grid(
+            row=3, column=0, columnspan=2, pady=(2, 0), sticky="w")
+
+        jog = self._card(left, "Jog")
         grid = ttk.Frame(jog)
-        grid.pack(**pad)
+        grid.pack(anchor="center")
         b = lambda text, axis, sign, r, c: ttk.Button(
-            grid, text=text, width=6, command=lambda: self.jog(axis, sign)).grid(row=r, column=c, padx=2, pady=2)
+            grid, text=text, width=5, command=lambda: self.jog(axis, sign)).grid(row=r, column=c, padx=2, pady=2)
         b("Y+", "Y", 1, 0, 1)
         b("X−", "X", -1, 1, 0)
         b("X+", "X", 1, 1, 2)
@@ -469,71 +530,78 @@ class App:
         b("Z↑", "Z", 1, 0, 4)
         b("Z↓", "Z", -1, 2, 4)
         self.jog_buttons = grid.winfo_children()
+        grid.columnconfigure(3, minsize=14)  # gap between the XY pad and the Z column
 
-        opts = ttk.Frame(jog)
-        opts.pack(fill="x", **pad)
-        ttk.Label(opts, text="Step mm").grid(row=0, column=0, sticky="w")
+        steps = ttk.Frame(jog)
+        steps.pack(fill="x", pady=(8, 4))
+        ttk.Label(steps, text="Step").pack(side="left", padx=(0, 6))
         self.step_var = tk.StringVar(value="1")
-        ttk.Combobox(opts, textvariable=self.step_var, values=["0.1", "1", "5", "10", "50"],
-                     width=6).grid(row=0, column=1, **pad)
-        ttk.Label(opts, text="Feed mm/min").grid(row=1, column=0, sticky="w")
+        for value in ("0.1", "1", "5", "10", "50"):
+            ttk.Radiobutton(steps, text=value, value=value, variable=self.step_var, style="Toolbutton",
+                            width=4).pack(side="left", padx=1)
+        ttk.Label(steps, text="mm", style="Muted.TLabel").pack(side="left", padx=(4, 0))
+        opts = ttk.Frame(jog)
+        opts.pack(fill="x")
+        ttk.Label(opts, text="Feed").pack(side="left", padx=(0, 6))
         self.feed_var = tk.StringVar(value="500")
-        ttk.Entry(opts, textvariable=self.feed_var, width=8).grid(row=1, column=1, **pad)
+        ttk.Entry(opts, textvariable=self.feed_var, width=7).pack(side="left")
+        ttk.Label(opts, text="mm/min", style="Muted.TLabel").pack(side="left", padx=(4, 0))
+        ttk.Label(jog, text="Keys  ← → ↑ ↓  PgUp/PgDn   ·   Esc stops", style="Muted.TLabel").pack(
+            anchor="w", pady=(6, 0))
 
-        cmds = ttk.LabelFrame(left, text="Machine")
-        cmds.pack(fill="x", **pad)
-        self.machine_buttons = []
-        for i, (text, fn) in enumerate([
-            ("Home", lambda: self.fw_command("home")),
-            ("Unlock", lambda: self.fw_command("unlock")),
-            ("Zero XYZ (G92)", lambda: self.send_line("G92 X0 Y0 Z0")),
-            ("Position", lambda: self.fw_command("position")),
-            ("Feed hold", lambda: self.fw_command("hold")),
-            ("Resume", lambda: self.fw_command("resume")),
-        ]):
-            btn = ttk.Button(cmds, text=text, command=fn)
-            btn.grid(row=i // 2, column=i % 2, sticky="ew", padx=2, pady=2)
-            self.machine_buttons.append(btn)
+        cmds = ttk.Frame(self._card(left, "Machine"))
+        cmds.pack(fill="x")
+        cmds.columnconfigure((0, 1), weight=1)
+        self.machine_btns = {}  # firmware command name (or "zero") -> button; hidden if the firmware lacks it
+        for key, text, fn in [
+            ("home", "⌂  Home", lambda: self.fw_command("home")),
+            ("zero", "Zero XYZ (G92)", lambda: self.send_line("G92 X0 Y0 Z0")),
+            ("unlock", "Unlock", lambda: self.fw_command("unlock")),
+            ("position", "Position", lambda: self.fw_command("position")),
+            ("hold", "Feed hold", lambda: self.fw_command("hold")),
+            ("resume", "Resume", lambda: self.fw_command("resume")),
+        ]:
+            self.machine_btns[key] = ttk.Button(cmds, text=text, command=fn,
+                                                style="Accent.TButton" if key == "home" else "TButton")
+        self.machine_buttons = list(self.machine_btns.values())
+        self._layout_machine_buttons()
 
-        spindle = ttk.LabelFrame(left, text="Spindle")
-        spindle.pack(fill="x", **pad)
-        ttk.Label(spindle, text="Speed (S)").grid(row=0, column=0, sticky="w", padx=4)
+        spindle = ttk.Frame(self._card(left, "Spindle"))
+        spindle.pack(fill="x")
+        spindle.columnconfigure((0, 1, 2), weight=1)
+        ttk.Label(spindle, text="Speed S").grid(row=0, column=0, sticky="w")
         self.speed_var = tk.StringVar(value="1000")
         self.speed_box = ttk.Spinbox(spindle, textvariable=self.speed_var, from_=SPINDLE_STEP, to=SPINDLE_MAX,
-                                     increment=SPINDLE_STEP, width=8)
-        self.speed_box.grid(row=0, column=1, **pad)
+                                     increment=SPINDLE_STEP, width=7)
+        self.speed_box.grid(row=0, column=1, sticky="w", pady=(0, 6))
         self.spindle_state_var = tk.StringVar(value="off")
-        ttk.Label(spindle, textvariable=self.spindle_state_var, width=10).grid(row=0, column=2, padx=4)
+        self.spindle_label = ttk.Label(spindle, textvariable=self.spindle_state_var, font=("Segoe UI", 9, "bold"))
+        self.spindle_label.grid(row=0, column=2, sticky="e")
         self.spindle_buttons = [self.speed_box]
-        for i, (text, fn) in enumerate([("Start (M3)", self.spindle_start), ("Set speed", self.spindle_set),
-                                        ("Stop (M5)", self.spindle_stop)]):
+        for i, (text, fn) in enumerate([("Start M3", self.spindle_start), ("Set speed", self.spindle_set),
+                                        ("Stop M5", self.spindle_stop)]):
             btn = ttk.Button(spindle, text=text, command=fn)
-            btn.grid(row=1, column=i, sticky="ew", padx=2, pady=2)
+            btn.grid(row=1, column=i, sticky="ew", padx=(0 if i == 0 else 4, 0))
             self.spindle_buttons.append(btn)
 
-        self.estop_btn = tk.Button(left, text="E-STOP", bg="#c62828", fg="white",
-                                   activebackground="#8e0000", activeforeground="white",
-                                   font=("Segoe UI", 16, "bold"), command=self.estop)
-        self.estop_btn.pack(fill="x", padx=4, pady=12, ipady=10)
+        # Right: tabs
+        self.tabs = ttk.Notebook(body)
+        self.tabs.pack(side="left", fill="both", expand=True)
+        # Clicking a tab would give it focus, and arrow keys would then switch tabs as well as jog.
+        self.tabs.bind("<<NotebookTabChanged>>", lambda e: self.root.focus_set())
 
-        # Right: console
-        right = ttk.Frame(body)
-        right.pack(side="left", fill="both", expand=True)
-        console = ttk.LabelFrame(right, text="Console")
-        console.pack(fill="both", expand=True, **pad)
-        self.log_text = tk.Text(console, height=10, font=("Consolas", 10), state="disabled",
-                                bg="#111", fg="#ddd", insertbackground="#ddd")
-        scroll = ttk.Scrollbar(console, command=self.log_text.yview)
+        console = ttk.Frame(self.tabs, style="Card.TFrame", padding=10)
+        self.tabs.add(console, text="  Console  ")
+        text_box = ttk.Frame(console)
+        text_box.pack(fill="both", expand=True)
+        self.log_text = tk.Text(text_box, height=10, font=("Consolas", 10), state="disabled", wrap="word",
+                                relief="flat", borderwidth=0, padx=8, pady=6)  # colours: apply_theme
+        scroll = ttk.Scrollbar(text_box, command=self.log_text.yview)
         self.log_text.configure(yscrollcommand=scroll.set)
         scroll.pack(side="right", fill="y")
         self.log_text.pack(fill="both", expand=True)
-        self.log_text.tag_configure("tx", foreground="#7fc7ff")
-        self.log_text.tag_configure("rx", foreground="#cfcfcf")
-        self.log_text.tag_configure("err", foreground="#ff6b6b")
-        self.log_text.tag_configure("info", foreground="#9ccc65")
-
-        entry_row = ttk.Frame(right)
-        entry_row.pack(fill="x", **pad)
+        entry_row = ttk.Frame(console)
+        entry_row.pack(fill="x", pady=(8, 0))
         self.cmd_var = tk.StringVar()
         self.cmd_entry = ttk.Entry(entry_row, textvariable=self.cmd_var, font=("Consolas", 11))
         self.cmd_entry.pack(side="left", fill="x", expand=True)
@@ -541,45 +609,71 @@ class App:
         self.cmd_entry.bind("<Up>", lambda e: self.history_step(-1))
         self.cmd_entry.bind("<Down>", lambda e: self.history_step(1))
         self.send_btn = ttk.Button(entry_row, text="Send", command=self.send_entry)
-        self.send_btn.pack(side="left", padx=4)
+        self.send_btn.pack(side="left", padx=(6, 0))
+        ttk.Button(entry_row, text="Clear", command=self.clear_log).pack(side="left", padx=(6, 0))
 
-        # PCB board: where the board sits on the machine, used to convert CAM G-code (cam_import.py)
-        board = ttk.LabelFrame(self.root, text="PCB board (for Import CAM)")
-        board.pack(fill="x", **pad)
+        # PCB job tab: 1 board position, 2 program, 3 run
+        job = ttk.Frame(self.tabs, style="Card.TFrame", padding=(16, 12))
+        self.tabs.add(job, text="  PCB job  ")
+        job.columnconfigure(0, weight=1)
+
+        ttk.Label(job, text="1 · BOARD POSITION", style="CardTitle.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(job, text="Home, jog the bit over the board's corner, then lower it until it just touches "
+                            "the copper. Redo the surface Z after every bit change.",
+                  style="Muted.TLabel", wraplength=640).grid(row=1, column=0, sticky="w", pady=(2, 8))
+        board = ttk.Frame(job)
+        board.grid(row=2, column=0, sticky="w")
         self.origin_x_var, self.origin_y_var, self.surface_var = tk.StringVar(), tk.StringVar(), tk.StringVar()
-        self.air_var = tk.BooleanVar(value=True)  # first runs are dry runs; untick for the real cut
+        self.air_var = tk.BooleanVar(value=False)  # tick for a dry run: the whole job is lifted by the offset
         self.air_offset_var = tk.StringVar(value="5")
-        ttk.Label(board, text="Origin X").pack(side="left", padx=(4, 0))
-        ttk.Entry(board, textvariable=self.origin_x_var, width=8).pack(side="left", **pad)
-        ttk.Label(board, text="Y").pack(side="left")
-        ttk.Entry(board, textvariable=self.origin_y_var, width=8).pack(side="left", **pad)
+        ttk.Label(board, text="Origin  X").grid(row=0, column=0, sticky="w")
+        ttk.Entry(board, textvariable=self.origin_x_var, width=9).grid(row=0, column=1, padx=6)
+        ttk.Label(board, text="Y").grid(row=0, column=2)
+        ttk.Entry(board, textvariable=self.origin_y_var, width=9).grid(row=0, column=3, padx=6)
         self.origin_btn = ttk.Button(board, text="Set origin here", command=self.set_origin_here)
-        self.origin_btn.pack(side="left", **pad)
-        ttk.Label(board, text="Surface Z").pack(side="left", padx=(12, 0))
-        ttk.Entry(board, textvariable=self.surface_var, width=8).pack(side="left", **pad)
+        self.origin_btn.grid(row=0, column=4, padx=(6, 0), sticky="ew")
+        ttk.Label(board, text="Surface  Z").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Entry(board, textvariable=self.surface_var, width=9).grid(row=1, column=1, padx=6, pady=(6, 0))
         self.surface_btn = ttk.Button(board, text="Set surface Z here", command=self.set_surface_here)
-        self.surface_btn.pack(side="left", **pad)
-        ttk.Checkbutton(board, text="Air test: lift by", variable=self.air_var).pack(side="left", padx=(12, 0))
-        ttk.Entry(board, textvariable=self.air_offset_var, width=4).pack(side="left", **pad)
-        ttk.Label(board, text="mm").pack(side="left")
+        self.surface_btn.grid(row=1, column=4, padx=(6, 0), pady=(6, 0), sticky="ew")
+        air = ttk.Frame(board)
+        air.grid(row=2, column=0, columnspan=5, sticky="w", pady=(8, 0))
+        ttk.Checkbutton(air, text="Air test: lift the whole job by", variable=self.air_var).pack(side="left")
+        ttk.Entry(air, textvariable=self.air_offset_var, width=4).pack(side="left", padx=6)
+        ttk.Label(air, text="mm (dry run)", style="Muted.TLabel").pack(side="left")
 
-        # Bottom: G-code file streaming
-        job = ttk.LabelFrame(self.root, text="G-code file")
-        job.pack(fill="x", **pad)
-        ttk.Button(job, text="Load…", command=self.load_file).pack(side="left", **pad)
-        ttk.Button(job, text="Import CAM…", command=self.import_cam).pack(side="left", **pad)
-        self.file_var = tk.StringVar(value="(no file)")
-        ttk.Label(job, textvariable=self.file_var, width=36).pack(side="left", **pad)
-        self.start_btn = ttk.Button(job, text="Start", command=self.start_job)
-        self.start_btn.pack(side="left", **pad)
-        self.pause_btn = ttk.Button(job, text="Pause", command=self.pause_job)
-        self.pause_btn.pack(side="left", **pad)
-        self.stop_btn = ttk.Button(job, text="Stop", command=self.stop_job)
-        self.stop_btn.pack(side="left", **pad)
-        self.progress = ttk.Progressbar(job, length=200)
-        self.progress.pack(side="left", fill="x", expand=True, **pad)
+        ttk.Separator(job).grid(row=3, column=0, sticky="ew", pady=14)
+        ttk.Label(job, text="2 · PROGRAM", style="CardTitle.TLabel").grid(row=4, column=0, sticky="w")
+        ttk.Label(job, text="Load… for ready-made Cirqoid G-code.  Import CAM… for FlatCAM / pcb2gcode output "
+                            "(converted to the board position above).",
+                  style="Muted.TLabel", wraplength=640).grid(row=5, column=0, sticky="w", pady=(2, 8))
+        program = ttk.Frame(job)
+        program.grid(row=6, column=0, sticky="ew")
+        ttk.Button(program, text="Load…", command=self.load_file).pack(side="left")
+        ttk.Button(program, text="Import CAM…", command=self.import_cam).pack(side="left", padx=6)
+        self.file_var = tk.StringVar(value="no file loaded")
+        ttk.Label(program, textvariable=self.file_var, font=("Segoe UI", 10, "bold")).pack(side="left", padx=8)
+
+        ttk.Separator(job).grid(row=7, column=0, sticky="ew", pady=14)
+        ttk.Label(job, text="3 · RUN", style="CardTitle.TLabel").grid(row=8, column=0, sticky="w", pady=(0, 8))
+        run = ttk.Frame(job)
+        run.grid(row=9, column=0, sticky="ew")
+        self.start_btn = ttk.Button(run, text="▶  Start", style="Accent.TButton", width=10, command=self.start_job)
+        self.start_btn.pack(side="left")
+        self.pause_btn = ttk.Button(run, text="Pause", width=8, command=self.pause_job)
+        self.pause_btn.pack(side="left", padx=6)
+        self.stop_btn = ttk.Button(run, text="■  Stop", width=8, command=self.stop_job)
+        self.stop_btn.pack(side="left")
         self.progress_var = tk.StringVar(value="")
-        ttk.Label(job, textvariable=self.progress_var, width=14).pack(side="left", **pad)
+        ttk.Label(run, textvariable=self.progress_var, width=12, anchor="e").pack(side="right")
+        self.progress = ttk.Progressbar(run)
+        self.progress.pack(side="left", fill="x", expand=True, padx=(12, 6))
+
+        ttk.Label(job, text="LAST MESSAGE", style="CardTitle.TLabel").grid(row=10, column=0, sticky="w",
+                                                                         pady=(18, 2))
+        self.last_msg_var = tk.StringVar(value="—")
+        self.last_msg_label = ttk.Label(job, textvariable=self.last_msg_var, wraplength=640)
+        self.last_msg_label.grid(row=11, column=0, sticky="w")
 
     # ---------- helpers ----------
     def log(self, text, tag="rx"):
@@ -589,14 +683,183 @@ class App:
             self.log_text.delete("1.0", "500.0")
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
+        if tag in ("info", "err"):  # also shown under "Last message" on the PCB job tab
+            self.last_msg_var.set(text.strip())
+            self.last_msg_tag = tag
+            self.last_msg_label.configure(foreground=self.palette[tag])
+
+    def _log_ok(self):
+        """Show an "ok" at the end of the command line it answers, instead of on a line of its own."""
+        last = "end-2c linestart"
+        if "tx" in self.log_text.tag_names(last) and "ok" not in self.log_text.tag_names("end-3c"):
+            self.log_text.configure(state="normal")
+            self.log_text.insert("end-2c", "   ✓ ok", "ok")
+            self.log_text.see("end")
+            self.log_text.configure(state="disabled")
+        else:
+            self.log("ok", "ok")
+
+    # ---------- theme ----------
+    @staticmethod
+    def _load_settings():
+        try:
+            return json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+
+    def _save_settings(self):
+        try:
+            SETTINGS_FILE.write_text(json.dumps({"theme": self.theme}), encoding="utf-8")
+        except OSError:
+            pass  # a preference that isn't saved is not worth an error
+
+    def toggle_theme(self):
+        self.apply_theme("dark" if self.theme == "light" else "light")
+        self._save_settings()
+
+    def apply_theme(self, name):
+        """Recolour every widget. Uses the 'clam' style because Windows' native style can't be recoloured."""
+        self.theme, p = name, THEMES[name]
+        self.palette = p
+        style = ttk.Style(self.root)
+        style.theme_use("clam")
+        self.root.configure(bg=p["app"])
+        style.configure(".", background=p["bg"], foreground=p["fg"], fieldbackground=p["field"],
+                        bordercolor=p["border"], lightcolor=p["bg"], darkcolor=p["bg"], troughcolor=p["field"],
+                        selectbackground=p["select"], selectforeground=p["fg"], insertcolor=p["fg"],
+                        focuscolor=p["accent"], arrowcolor=p["fg"])
+        style.map(".", foreground=[("disabled", p["disabled"])])
+        style.configure("TButton", background=p["button"], padding=(6, 1), lightcolor=p["button"],
+                        darkcolor=p["button"])
+        style.map("TButton", background=[("disabled", p["bg"]), ("pressed", p["hover"]), ("active", p["hover"])],
+                  lightcolor=[("active", p["hover"])], darkcolor=[("active", p["hover"])])
+        style.configure("Toolbutton", background=p["bg"], padding=(4, 2), anchor="center")
+        style.map("Toolbutton", background=[("selected", p["select"]), ("active", p["hover"])])
+        for widget in ("TEntry", "TCombobox", "TSpinbox"):
+            style.configure(widget, fieldbackground=p["field"], foreground=p["fg"], background=p["button"],
+                            lightcolor=p["field"], darkcolor=p["field"])
+            style.map(widget, fieldbackground=[("disabled", p["bg"]), ("readonly", p["field"])],
+                      foreground=[("disabled", p["disabled"])],
+                      selectbackground=[("readonly", p["field"])], selectforeground=[("readonly", p["fg"])])
+        for widget in ("TCheckbutton", "TRadiobutton"):
+            style.configure(widget, indicatorbackground=p["field"], indicatorforeground=p["fg"])
+            style.map(widget, background=[("active", p["bg"])],
+                      indicatorbackground=[("selected", p["field"]), ("disabled", p["bg"])])
+        style.configure("App.TFrame", background=p["app"])
+        style.configure("Card.TFrame", background=p["bg"])
+        style.configure("CardTitle.TLabel", foreground=p["muted"], font=("Segoe UI", 8, "bold"))
+        style.configure("Muted.TLabel", foreground=p["muted"])
+        style.configure("Axis.TLabel", foreground=p["muted"], font=("Segoe UI", 14, "bold"))
+        style.configure("DRO.TLabel", foreground=p["fg"], font=("Consolas", 18, "bold"))
+        style.configure("Accent.TButton", background=p["accent"], foreground=p["accent_fg"],
+                        bordercolor=p["accent"], lightcolor=p["accent"], darkcolor=p["accent"],
+                        font=("Segoe UI", 9, "bold"))
+        style.map("Accent.TButton",
+                  background=[("disabled", p["button"]), ("pressed", p["accent_hover"]), ("active", p["accent_hover"])],
+                  foreground=[("disabled", p["disabled"])],
+                  bordercolor=[("disabled", p["border"])],
+                  lightcolor=[("disabled", p["button"]), ("active", p["accent_hover"])],
+                  darkcolor=[("disabled", p["button"]), ("active", p["accent_hover"])])
+        style.configure("TNotebook", background=p["app"], borderwidth=0, tabmargins=(0, 0, 0, 0))
+        style.configure("TNotebook.Tab", background=p["app"], foreground=p["muted"], padding=(14, 6),
+                        bordercolor=p["app"], lightcolor=p["app"], font=("Segoe UI", 9, "bold"))
+        style.map("TNotebook.Tab", background=[("selected", p["bg"]), ("active", p["hover"])],
+                  foreground=[("selected", p["fg"]), ("active", p["fg"])],
+                  lightcolor=[("selected", p["bg"])], bordercolor=[("selected", p["bg"])])
+        style.configure("TSeparator", background=p["border"])
+        style.configure("Horizontal.TProgressbar", background=p["accent"], troughcolor=p["field"],
+                        lightcolor=p["accent"], darkcolor=p["accent"])
+        style.configure("TScrollbar", background=p["button"], troughcolor=p["bg"], lightcolor=p["button"],
+                        darkcolor=p["button"])
+        style.map("TScrollbar", background=[("active", p["hover"])])
+        # Drop-down lists of the comboboxes are plain Tk listboxes.
+        for option, value in (("background", p["field"]), ("foreground", p["fg"]),
+                              ("selectBackground", p["select"]), ("selectForeground", p["fg"])):
+            self.root.option_add(f"*TCombobox*Listbox.{option}", value)
+        for box in self.comboboxes:
+            try:
+                popdown = self.root.tk.call("ttk::combobox::PopdownWindow", box)
+                self.root.tk.call(f"{popdown}.f.l", "configure", "-background", p["field"], "-foreground",
+                                  p["fg"], "-selectbackground", p["select"], "-selectforeground", p["fg"])
+            except tk.TclError:
+                pass
+        self.log_text.configure(bg=p["console_bg"], fg=p["console_fg"], insertbackground=p["console_fg"],
+                                selectbackground=p["select"])
+        for tag in ("tx", "err", "info", "ok"):
+            self.log_text.tag_configure(tag, foreground=p[tag])
+        self.log_text.tag_configure("rx", foreground=p["console_fg"])
+        self.theme_btn.configure(text="☀ Light" if name == "dark" else "☾ Dark")
+        self.status_label.configure(foreground=p["good"] if self.link else p["muted"])
+        self.spindle_label.configure(foreground=p["good"] if self.spindle_on else p["muted"])
+        self.last_msg_label.configure(foreground=p[self.last_msg_tag] if self.last_msg_tag else p["muted"])
+
+    def clear_log(self):
+        self.log_text.configure(state="normal")
+        self.log_text.delete("1.0", "end")
+        self.log_text.configure(state="disabled")
+
+    def _set_position(self, x=None, y=None, z=None, note=""):
+        for axis, value in zip("XYZ", (x, y, z)):
+            if value is None:
+                text = "—"
+            else:
+                try:
+                    text = f"{float(value):.3f}"
+                except ValueError:
+                    text = str(value)
+            self.pos_vars[axis].set(text)
+        self.pos_note_var.set(note)
+
+    def _firmware_changed(self):
+        self.baud_var.set(DEFAULT_BAUD[self.fw_var.get()])
+        self._layout_machine_buttons()
+        self._update_controls()
+
+    def _layout_machine_buttons(self):
+        """Show only the machine buttons the selected firmware has a command for."""
+        fw = FIRMWARE[self.fw_var.get()]
+        visible = [btn for key, btn in self.machine_btns.items() if key == "zero" or fw.get(key) is not None]
+        for btn in self.machine_btns.values():
+            btn.grid_remove()
+        for i, btn in enumerate(visible):
+            btn.grid(row=i // 2, column=i % 2, sticky="ew", padx=2, pady=2)
+
+    def _bind_keys(self):
+        keys = {"<Left>": ("X", -1), "<Right>": ("X", 1), "<Up>": ("Y", 1), "<Down>": ("Y", -1),
+                "<Prior>": ("Z", 1), "<Next>": ("Z", -1)}
+        for key, (axis, sign) in keys.items():
+            self.root.bind(key, lambda e, a=axis, s=sign: self._key_jog(a, s))
+        self.root.bind("<Escape>", lambda e: self.estop())
+
+    def _typing(self):
+        try:
+            widget = self.root.focus_get()
+        except (KeyError, tk.TclError):
+            return False
+        if isinstance(widget, tk.Text):  # the console is read-only: keys there should still jog
+            return widget.cget("state") == "normal"
+        return isinstance(widget, (tk.Entry, ttk.Entry, tk.Spinbox))
+
+    def _key_jog(self, axis, sign):
+        if not self._typing() and self.link and not self.job_running():
+            self.jog(axis, sign)
 
     def job_running(self):
         return self.job_total > 0 and self.job_done < self.job_total
 
     def _set_connected(self, connected):
         self.connect_btn.configure(text="Disconnect" if connected else "Connect")
-        if not connected:
-            self.status_var.set("Disconnected")
+        if connected:
+            self.status_var.set("● Connected")
+            self.status_label.configure(foreground=self.palette["good"])
+            if self.tracker:
+                self._set_position(note="not homed — press Home")
+            else:
+                self._set_position(note="connected")
+        else:
+            self.status_var.set("○ Disconnected")
+            self.status_label.configure(foreground=self.palette["muted"])
+            self._set_position(note="disconnected")
         self._update_controls()
 
     def _update_controls(self):
@@ -607,8 +870,8 @@ class App:
                   + [self.send_btn, self.cmd_entry, self.origin_btn, self.surface_btn]):
             w.configure(state=manual)
         if connected and self.fw_var.get() == "GRBL":  # real-time commands work mid-job on GRBL
-            for w in self.machine_buttons[4:]:
-                w.configure(state="normal")
+            for key in ("hold", "resume"):
+                self.machine_btns[key].configure(state="normal")
         self.estop_btn.configure(state="normal" if connected else "disabled")
         self.start_btn.configure(state="normal" if connected and not running and self.job_lines else "disabled")
         self.pause_btn.configure(state="normal" if running else "disabled")
@@ -636,6 +899,7 @@ class App:
         self.pending.clear()
         self.sent.clear()
         self.tracker = PositionTracker(SOFT_LIMITS.get(fw)) if fw in ABSOLUTE_ONLY else None
+        self.display = PositionTracker() if fw in ABSOLUTE_ONLY else None  # follows lines as they go out
         self._set_spindle(False)
         self.log(f"Connected to {choice} @ {self.baud_var.get()} ({fw})", "info")
         if fw in ABSOLUTE_ONLY:
@@ -691,7 +955,7 @@ class App:
             self.link.close()
             self.link = None
         self.job_total = self.job_done = 0
-        self.tracker = None
+        self.tracker = self.display = None
         self.pending.clear()
         self.sent.clear()
         self._set_spindle(False)
@@ -717,7 +981,6 @@ class App:
     def _enqueue(self, line, snapshot, job=False):
         tag, self.next_tag = self.next_tag, self.next_tag + 1
         self.pending[tag] = (snapshot, line)
-        self._note_spindle(line)
         self.link.send(line, job, tag)
 
     def _line_done(self, tag, reply, job):
@@ -737,6 +1000,12 @@ class App:
             for later, (_, later_line) in list(self.pending.items()):  # replay what is still queued
                 self.pending[later] = (self.tracker.copy(), later_line)
                 self.tracker.apply(later_line)
+            if self.display:  # redo the display from before the refused line, plus what went out after it
+                self.display = snapshot.copy()
+                self.display.limits = {}
+                for later, (_, later_line) in self.pending.items():
+                    if later in self.sent:
+                        self.display.apply(later_line)
             self._show_position()
             self.log(f"Position kept as before '{line}' (the machine refused it)", "err")
         elif job and self.job_total:
@@ -758,10 +1027,18 @@ class App:
     def _dialect(self, line):
         return decimal_words(line) if self.fw_var.get() == "Cirqoid" else line
 
+    def _on_sent(self, line):
+        """A line has actually been written to the machine: update spindle state and the position readout."""
+        self._note_spindle(line)
+        if self.display:
+            self.display.apply(line)
+            self._show_position()
+
     def _show_position(self):
-        work = self.tracker.work() if self.tracker else None
+        source = self.display or self.tracker  # the readout shows what has been sent, not what is queued
+        work = source.work() if source else None
         if work:
-            self.status_var.set(f"X {work['X']:.3f}  Y {work['Y']:.3f}  Z {work['Z']:.3f}  (as sent)")
+            self._set_position(work["X"], work["Y"], work["Z"], "homed · position as sent")
 
     # ---------- spindle ----------
     def _speed(self):
@@ -805,7 +1082,8 @@ class App:
 
     def _set_spindle(self, on, speed=None):
         self.spindle_on = on
-        self.spindle_state_var.set(f"on S{speed}" if on and speed else "on" if on else "off")
+        self.spindle_state_var.set(f"● on S{speed}" if on and speed else "● on" if on else "off")
+        self.spindle_label.configure(foreground=self.palette["good"] if on else self.palette["muted"])
 
     def send_entry(self):
         line = self.cmd_var.get().strip()
@@ -895,8 +1173,15 @@ class App:
         if not path:
             return
         with open(path, encoding="utf-8", errors="replace") as fh:
-            self.job_lines = clean_gcode(fh.read())
-        self.file_var.set(f"{path.replace(chr(92), '/').split('/')[-1]} ({len(self.job_lines)} lines)")
+            lines = clean_gcode(fh.read())
+        if self.fw_var.get() in ABSOLUTE_ONLY and looks_like_cam(lines) and messagebox.askyesno(
+                "Load", "This looks like CAM G-code: its Z is measured from the copper surface "
+                        "(Z0 = copper, positive = above it), not from the machine's top.\n\n"
+                        "Convert it with Import CAM, using the board origin and surface Z?"):
+            self.import_cam(path)
+            return
+        self.job_lines = lines
+        self.file_var.set(f"{path.replace(chr(92), '/').split('/')[-1]} — {len(self.job_lines)} lines")
         self.log(f"Loaded {path}: {len(self.job_lines)} lines", "info")
         self._update_controls()
 
@@ -920,7 +1205,7 @@ class App:
             self.surface_var.set(fmt(work["Z"]))
             self.log(f"Copper surface set to Z{fmt(work['Z'])} (re-do this after every bit change)", "info")
 
-    def import_cam(self):
+    def import_cam(self, path=None):
         """Load G-code from FlatCAM / pcb2gcode, converted to the Cirqoid dialect at the board's position."""
         try:
             origin_x, origin_y, surface = (float(v.get()) for v in
@@ -931,7 +1216,7 @@ class App:
                                  "Home, jog the bit over the board corner and press 'Set origin here', then "
                                  "lower it onto the copper and press 'Set surface Z here'.")
             return
-        path = filedialog.askopenfilename(
+        path = path or filedialog.askopenfilename(
             title="G-code from FlatCAM / pcb2gcode",
             filetypes=[("CAM G-code", "*.nc *.ngc *.gcode *.cnc *.tap *.txt"), ("All files", "*.*")])
         if not path:
@@ -950,7 +1235,8 @@ class App:
         section = result.sections[index]
         self.job_lines = list(section.lines)
         name = path.replace(chr(92), "/").split("/")[-1]
-        self.file_var.set(f"{name} · {section.tool} ({len(self.job_lines)} lines, converted)")
+        tool = "" if section.tool == "(no tool)" else f" · {section.tool}"
+        self.file_var.set(f"{name}{tool} — {len(self.job_lines)} lines, converted")
         self.log(f"Imported {name}: {section.tool}{' - ' + section.note if section.note else ''}, "
                  f"{len(self.job_lines)} lines", "info")
         for warning in result.warnings:
@@ -971,13 +1257,15 @@ class App:
 
     def _pick_section(self, sections):
         """Ask which tool section of a multi-tool file to load. Returns its index, or None."""
-        win = tk.Toplevel(self.root)
+        win = tk.Toplevel(self.root, bg=self.palette["bg"])
         win.title("Pick the tool to run")
         win.transient(self.root)
         win.grab_set()
         ttk.Label(win, text="This file uses several tools. Load one at a time: change the bit and set the "
                             "surface Z before each.").pack(padx=8, pady=6)
-        box = tk.Listbox(win, width=80, height=min(10, len(sections)))
+        p = self.palette
+        box = tk.Listbox(win, width=80, height=min(10, len(sections)), bg=p["field"], fg=p["fg"],
+                         selectbackground=p["select"], selectforeground=p["fg"], highlightthickness=0)
         for section in sections:
             box.insert("end", f"{section.tool}   {section.note}   ({len(section.lines)} lines)")
         box.selection_set(0)
@@ -1009,6 +1297,9 @@ class App:
                 error = preview.apply(line)
                 if error:
                     self.log(f"Job not started: line {number} '{line}': {error}", "err")
+                    if looks_like_cam(self.job_lines):
+                        self.log("  This file's Z is measured from the copper surface (CAM G-code): open it "
+                                 "with Import CAM… instead of Load…", "err")
                     return
             self.tracker = preview
         self.job_total, self.job_done = len(lines), 0
@@ -1060,6 +1351,7 @@ class App:
                 if kind == "tx":
                     self.log(rest[0], "tx")
                     self.sent.add(rest[1])
+                    self._on_sent(rest[0])
                 elif kind == "rx":
                     self._handle_rx(rest[0])
                 elif kind == "error":
@@ -1079,11 +1371,14 @@ class App:
             fields = text[1:-1].split("|")
             pos = next((f.split(":", 1)[1] for f in fields if f.startswith(("MPos:", "WPos:"))), "")
             x, y, z = (pos.split(",") + ["?", "?", "?"])[:3]
-            self.status_var.set(f"{fields[0]:<6}  X {x}  Y {y}  Z {z}")
+            self._set_position(x, y, z, fields[0])
             return
         match = MARLIN_POS_RE.search(text)
         if match:
-            self.status_var.set("X {}  Y {}  Z {}".format(*match.groups()))
+            self._set_position(*match.groups(), "reported by the machine")
+        if text == "ok":
+            self._log_ok()
+            return
         self.log(text, "err" if text.lower().startswith(("error", "alarm", "nack")) else "rx")
 
     def _poll_status(self):

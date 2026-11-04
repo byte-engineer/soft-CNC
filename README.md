@@ -58,6 +58,9 @@ FlatCAM / pcb2gcode, which still needs converting. Both examples home first and 
 they move in the air.
 - `examples/cirqoid_small_square.gcode`: a 10 mm square at X10–20, Y10–20. Run this first.
 - `examples/cirqoid_square.gcode`: a 90 mm square at X5–95, Y5–95, traced four times.
+- `examples/etch_square_circle.gcode`: spindle on, then a 20 × 20 mm square with an 8 mm-radius circle inside,
+  etched 0.2 mm deep. It's written CAM-style (X0 Y0 = square corner, Z0 = copper surface), so open it with
+  **Import CAM…** after **Set origin here** and **Set surface Z here**, not with **Load…**.
 
 ## Making a PCB (FlatCAM / pcb2gcode → Cirqoid)
 
@@ -89,9 +92,9 @@ Spindle up to 1400. Export one G-code file per job, or one file with tool change
 3. Jog the bit over the board's corner (CAM X0 Y0) and press **Set origin here**.
 4. Lower Z in small steps until the bit just touches the copper (paper test) and press **Set surface Z here**.
    Do this again after every bit change, because bits differ in length.
-5. Press **Import CAM…** with **Air test** ticked. The whole job is lifted 5 mm.
-   Press **Start** and watch it cut the air.
-6. Untick **Air test**, press **Import CAM…** again and **Start** the real cut.
+5. Optional dry run: tick **Air test** (off by default) and press **Import CAM…**. The whole job is lifted
+   by the offset (5 mm), so **Start** cuts only air.
+6. With **Air test** unticked, press **Import CAM…** and **Start** the real cut.
 
 A file with several tools asks which one to load. Run them one at a time, repeating steps 1 and 4 for each.
 Before anything is sent, the converted job is checked against the soft limits.
