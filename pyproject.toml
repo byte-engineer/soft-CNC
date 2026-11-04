@@ -1,0 +1,11 @@
+[project]
+name = "soft-cnc"
+version = "0.1.0"
+description = "Small G-code control panel for a USB-connected CNC (test program)"
+requires-python = ">=3.12"
+dependencies = ["pyserial>=3.5"]
+
+[tool.uv]
+package = false
+# The system Python on this machine ships without tkinter; uv's managed builds include it.
+python-preference = "only-managed"
