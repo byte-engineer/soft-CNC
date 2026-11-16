@@ -1,44 +1,52 @@
 # Soft-CNC
 
-Small G-code control panel for a USB-connected CNC (test program). Tkinter + pyserial, run through uv.
+Small G-code control panel for the Cirqoid PCB mill (and GRBL / Marlin machines) over USB serial.
+Written in Rust with [egui](https://github.com/emilk/egui). The earlier Python/Tkinter version is at git tag
+`v1.0-python`.
 
 ```
-uv run cnc_ui.py
+cargo run --release
 ```
 
-(uv is configured to use its managed Python, because the system Python here has no tkinter.)
+The app is then also at `target/release/soft-cnc.exe` (a single file you can copy anywhere).
+Run the tests with `cargo test`.
 
 ## Use
 
 1. Pick the **Port** (the machine shows up as `COM8 — USB Serial Port`), the **Baud** and the **Firmware**, then **Connect**.
-   Choose `SIMULATOR` to try everything without hardware.
+   Without hardware, pick `SIMULATOR-CIRQOID` (behaves like the Cirqoid) or `SIMULATOR` (GRBL-like).
    **Auto-detect** tries every common baud rate, then rates 2–4% off them, using info queries only
    (`$I`, `?`, `M115`, `M114`, no motion). It fills in Baud and Firmware for you (takes up to ~2 minutes).
 2. **Jog**: X/Y/Z buttons move by *Step* mm at *Feed* mm/min (GRBL uses `$J=` jog commands; others use `G91 / G1 / G90`).
-3. **Console**: type any G-code line and press Enter (↑/↓ for history). `?`, `!`, `~` are sent as GRBL real-time characters.
-4. **G-code file**: Load → Start. Lines go out one at a time, each waiting for `ok`. Pause / Stop stop sending more lines.
-5. **Spindle**: set the speed (S, whole number, steps of 50, max 1400) and press **Start (M3)**, which sends `M3 S<speed>`.
-   **Set speed** changes the speed while it runs. **Stop (M5)** sends `M5`. The label shows the state the app last sent.
+   Keys: ← → jog X, ↑ ↓ jog Y, PgUp/PgDn jog Z, **Esc = E-STOP** (not while typing in a box).
+3. **Console** tab: type any G-code line and press Enter (↑/↓ for history). `?`, `!`, `~` are sent as GRBL real-time
+   characters. An `ok` reply is shown as ✓ ok on the line it answers.
+4. **PCB job** tab: board position, **Load…** (a G-code file, or Gerber + drill files — see below), the **Jobs**
+   list and **Start / Pause / Stop** with progress.
+   Lines go out one at a time, each waiting for the controller's answer. The latest message is shown there too.
+5. **Spindle**: set the speed (S, whole number, steps of 50, max 1400) and press **Start M3**, which sends `M3 S<speed>`.
+   **Set speed** changes the speed while it runs. **Stop M5** sends `M5`. The label shows the state last sent.
 6. **E-STOP** clears the queue and sends `Ctrl-X` (GRBL soft reset) or `M112` (Marlin/Generic).
    It's a software stop. Keep the machine's hardware e-stop within reach.
+7. **☾ Dark / ☀ Light** switches the theme; the choice is remembered in `~/.soft-cnc.json`.
 
 | Button   | Cirqoid (default) | GRBL | Marlin / Generic |
 |----------|-------------------|------|------------------|
 | Home     | `G90`, `G21`, `G28 Y0.835` | `$H` | `G28` |
 | Unlock   | – | `$X` | `M999` / – |
-| Position | – (app shows the position it last sent) | `?` (also polled every 250 ms) | `M114` |
+| Position | – (the readout shows the position last sent) | `?` (also polled every 250 ms) | `M114` |
 | Feed hold / Resume | – | `!` / `~` | – |
 | E-STOP   | `M5` (spindle off only) | `Ctrl-X` | `M112` |
 
 **Cirqoid notes** (38400 baud, Newline):
-- It sends **no reply** for commands it accepts. The app waits 0.5 s per line for a possible `nack`,
-  treats silence as accepted, and shows any `nack` in red.
-- Example programs are in `examples/` (see **Examples** below).
-  Make sure nothing on the bed is high enough to be hit at that depth.
+- It sends **no reply** for setting lines it accepts (`G90`, `G21`, `M3`…). The app waits 0.5 s per such line for a
+  possible `nack`, treats silence as accepted, and shows any `nack` in red.
 - Its controller only takes absolute moves (no `G91`). Press **Home** (`G90`, `G21`, `G28 Y0.835`) before moving.
   The app then tracks the position from what it sends and jogs with absolute moves like `G0 X1.0 F500.0`
-  (every number gets a decimal point). Moves and homing are answered with `ok` or `error: ...`; the app waits for that answer (up to 2 minutes for homing). If the machine refuses a move, the tracked position stays where it was and a running job stops.
-- **Soft limits**, measured from home: X 0 to 103.0, Y 0 to 224.835, Z -26.9 to 0 mm (`SOFT_LIMITS` in `cnc_ui.py`).
+  (every number gets a decimal point). Moves and homing are answered with `ok` or `error: ...`; the app waits for that
+  answer (up to 2 minutes for homing). If the machine refuses a move, the position stays where it was and a running
+  job stops.
+- **Soft limits**, measured from home: X 0 to 103.0, Y 0 to 224.835, Z -26.9 to 0 mm (`CIRQOID` in `src/firmware.rs`).
   Z is 0 at the top (home) and negative going down; -26.9 is the lowest point (the controller refuses positive Z).
   Z jogs are capped at F300, like Cirqoid's own programs.
   A jog that would cross a limit is shortened to stop at it. A typed move outside a limit is not sent.
@@ -51,61 +59,96 @@ uv run cnc_ui.py
   Unplug the USB cable, power-cycle the machine, and plug the cable back in. (Rapid baud-rate switching
   on an open port caused this once.)
 
+## Loading G-code
+
+There's one **Load…** button, and any G-code file can be loaded. With the Cirqoid selected, every file is
+rewritten into G-code the Cirqoid understands (`src/cam.rs`):
+- every number gets a decimal point and every move an F;
+- relative moves (`G91`) become absolute positions;
+- arcs (`G2`/`G3`) become short straight moves;
+- `G81`/`G83` drill cycles are spelled out;
+- inches become mm;
+- spindle speed is capped at S1400 and Z moves at F300;
+- tool changes split the file into one part per tool;
+- codes the Cirqoid can't use (dwell, coolant…) are skipped, with a note in the console.
+
+How the positions are read is decided from the file itself, and the console says which it chose (`read as …`):
+- **CAM G-code** (from FlatCAM / pcb2gcode: it goes above Z0 and never homes) measures Z from the copper surface,
+  so it is placed at the **board origin** and **surface Z** set on the PCB job tab. If those aren't set yet, the app
+  says so instead of loading.
+- **Anything else** is taken to be in machine coordinates already (Z0 = machine top, like the examples): positions
+  are kept, including its homing line.
+
+Other firmwares (GRBL, Marlin, Generic) understand ordinary G-code, so their files are sent as written.
+
 ## Examples
 
-These are ready-made Cirqoid G-code, so open them with **Load…**. **Import CAM…** is only for G-code from
-FlatCAM / pcb2gcode, which still needs converting. Both examples home first and stay at the top (`Z0.0`), so
-they move in the air.
+Open them with **Load…**. The two squares are in machine coordinates: they home first and stay at the top
+(`Z0.0`), so they move in the air.
 - `examples/cirqoid_small_square.gcode`: a 10 mm square at X10–20, Y10–20. Run this first.
 - `examples/cirqoid_square.gcode`: a 90 mm square at X5–95, Y5–95, traced four times.
 - `examples/etch_square_circle.gcode`: spindle on, then a 20 × 20 mm square with an 8 mm-radius circle inside,
-  etched 0.2 mm deep. It's written CAM-style (X0 Y0 = square corner, Z0 = copper surface), so open it with
-  **Import CAM…** after **Set origin here** and **Set surface Z here**, not with **Load…**.
+  etched 0.2 mm deep. It's written CAM-style (X0 Y0 = square corner, Z0 = copper surface), so press
+  **Set origin here** and **Set surface Z here** before loading it.
 
-## Making a PCB (FlatCAM / pcb2gcode → Cirqoid)
+## Making a PCB straight from Gerber files
 
-Make the toolpaths in a CAM tool. **FlatCAM** is recommended: it has a GUI, and its *Double-Sided PCB* tool
-handles mirroring and alignment holes. **pcb2gcode** works too. Then use **Import CAM…** in this app.
-It converts the file to the Cirqoid dialect (`cam_import.py`):
-- every number gets a decimal point and every move an F;
-- Z is moved from "0 = copper surface" to the machine (0 = top, negative = down);
-- arcs become short straight moves;
-- `G81`/`G83` drill cycles are expanded;
-- inches become mm;
-- spindle speed is capped at S1400 and Z moves at F300;
-- tool changes split the file into one part per tool.
+No separate CAM program is needed: the app does what FlatCAM does (`src/pcb/`).
 
-**CAM settings:** units mm, absolute coordinates, board corner at X0 Y0.
-Start with the values below and adjust them to your bits:
+1. **Export from your PCB program** (KiCad: *File → Plot* for **F.Cu**, **B.Cu** if double-sided, and
+   **Edge.Cuts**; then *Generate Drill Files*, Excellon, millimetres). KiCad's X2 attributes say which layer each
+   file is; other programs' files are recognised by name (`.gtl`, `.gbl`, `.gko`, `.drl`…).
+2. **Load…** and select all of those files together. The **PCB setup** opens:
+   - the layers it found, the board size, and any notes;
+   - the tool settings (remembered for next time):
 
-| Job | Cut Z | Travel Z | Feed XY / Z |
-|-----|-------|----------|-------------|
-| Isolation (V-bit) | −0.05 to −0.1 | 2 | 100–150 / 50–60 mm/min |
-| Drilling | −1.8 (1.6 mm board + margin) | 2 | — / 60–150 mm/min |
-| Board outline (end mill) | −1.8, in several passes | 2 | 100 / 50 mm/min |
+     | Job | Defaults |
+     |-----|----------|
+     | Isolation (V-bit) | cut width 0.2 mm, 2 passes, 40 % overlap, 0.1 mm deep, F120 |
+     | Drilling | 1.8 mm deep (1.6 mm board + margin), plunge F60, one job per drill size |
+     | Cutout (end mill) | 1 mm tool, 1.8 mm deep in 0.6 mm passes, F100, 4 tabs 2 mm wide, 0.6 mm thick |
+     | General | travel height 2 mm, plunge F50, spindle S1000 |
 
-Spindle up to 1400. Export one G-code file per job, or one file with tool changes.
+   - a **preview** of copper and toolpaths (hover a job to highlight it), and the jobs in the order to run them.
+3. **Create jobs**. They appear in the **Jobs** list on the PCB job tab. X0 Y0 is the board's lower-left
+   corner, Z0 the copper surface.
+4. **For each job:** fit the bit it names, jog to the board corner and **Set origin here** (once), lower onto the
+   copper and **Set surface Z here** (after every bit change), press **Load** next to the job, then **Start**.
+   Each job is converted when you load it, so it always uses the current surface Z.
 
-**For each tool:**
-1. Fix the copper board to the bed and insert the bit.
-2. Connect and press **Home**.
-3. Jog the bit over the board's corner (CAM X0 Y0) and press **Set origin here**.
-4. Lower Z in small steps until the bit just touches the copper (paper test) and press **Set surface Z here**.
-   Do this again after every bit change, because bits differ in length.
-5. Optional dry run: tick **Air test** (off by default) and press **Import CAM…**. The whole job is lifted
-   by the offset (5 mm), so **Start** cuts only air.
-6. With **Air test** unticked, press **Import CAM…** and **Start** the real cut.
+**Double-sided boards** (needs top and bottom copper; tick *Mirror the bottom layer, add alignment holes*):
+1. **Alignment holes** first: two holes on the board's centre line, 5 mm below and above it, drilled through into
+   the bed. Put pins in them.
+2. Top isolation, then the drills.
+3. Flip the board **left-to-right** onto the pins, then run the **bottom isolation** (mirrored about the centre
+   line, so the board corner stays at the same origin).
+4. Flip back and run the **cutout**.
 
-A file with several tools asks which one to load. Run them one at a time, repeating steps 1 and 4 for each.
-Before anything is sent, the converted job is checked against the soft limits.
-Nothing runs if any move would leave the machine's travel, and the console names the offending line.
-
-**Double-sided boards:** in FlatCAM's Double-Sided tool, add alignment holes and mirror the bottom layer about
-the axis it shows.
-1. Drill the alignment holes and mill the top side.
-2. Flip the board onto pins in those holes.
-3. Run the mirrored bottom files with the **same origin**.
+A board with only bottom copper is milled face-down: all its jobs are mirrored.
 
 **Not yet checked on the machine:** whether it accepts `G4` dwell (so the converter skips dwells) and `G2`/`G3`
 arcs (so they're converted to straight lines).
-# soft-CNC
+
+**Not yet checked on the machine:** whether it accepts `G4` dwell (so the converter skips dwells) and `G2`/`G3`
+arcs (so they're converted to straight lines).
+
+## Code
+
+| File | What it does |
+|------|--------------|
+| `src/app.rs` | The egui window: cards, tabs, theme, keyboard, Jobs list |
+| `src/app/pcb_setup.rs` | The PCB setup dialog: layers, tool settings, preview |
+| `src/pcb/gerber.rs` | Gerber reader (apertures, KiCad macros, tracks, arcs, zones, polarity) |
+| `src/pcb/excellon.rs` | Drill-file reader (holes, slots, mm/inch) |
+| `src/pcb/mod.rs` | Recognises layers, finds the board shape, moves the board to X0 Y0 |
+| `src/pcb/toolpath.rs` | Isolation, drilling, cutout with tabs, double-sided jobs |
+| `src/controller.rs` | Everything the app does with the machine, without UI (tested headless) |
+| `src/link.rs` | Serial threads: send a line, wait for its answer; read replies |
+| `src/firmware.rs` | Cirqoid / GRBL / Marlin / Generic profiles and limits |
+| `src/tracker.rs` | Position tracking and soft limits |
+| `src/cam.rs` | Any G-code (incl. FlatCAM / pcb2gcode output) → Cirqoid converter |
+| `src/gcode.rs` | G-code text helpers (decimal points, comments, CAM detection) |
+| `src/detect.rs` | Auto-detect of baud rate and firmware |
+| `src/sim.rs` | Built-in simulators |
+| `tests/controller.rs` | End-to-end tests against the simulators |
+| `tests/pcb.rs` | Gerber + drill files → jobs, with KiCad-style sample files |
